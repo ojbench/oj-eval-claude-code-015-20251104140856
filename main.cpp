@@ -3,50 +3,84 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <filesystem>
+#include <map>
+#include <set>
 #include <sstream>
 #include <cstring>
 
-namespace fs = std::filesystem;
-
 class FileStorage {
 private:
-    std::string base_dir;
+    std::string data_file;
+    std::string index_file;
 
-    std::string sanitize_filename(const std::string& index) {
-        std::string sanitized;
-        for (char c : index) {
-            if (std::isalnum(c) || c == '_' || c == '-') {
-                sanitized += c;
-            } else {
-                sanitized += '_';
-            }
+    struct IndexEntry {
+        std::string key;
+        size_t offset;
+        size_t size;
+
+        IndexEntry() : offset(0), size(0) {}
+        IndexEntry(const std::string& k, size_t o, size_t s) : key(k), offset(o), size(s) {}
+    };
+
+    void save_index(const std::map<std::string, IndexEntry>& index) {
+        std::ofstream file(index_file, std::ios::binary);
+        if (!file) return;
+
+        size_t count = index.size();
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+        for (const auto& [key, entry] : index) {
+            size_t key_len = key.length();
+            file.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+            file.write(key.c_str(), key_len);
+            file.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
+            file.write(reinterpret_cast<const char*>(&entry.size), sizeof(entry.size));
         }
-        return sanitized;
+
+        file.close();
     }
 
-    std::string get_file_path(const std::string& index) {
-        return base_dir + "/" + sanitize_filename(index) + ".dat";
+    std::map<std::string, IndexEntry> load_index() {
+        std::map<std::string, IndexEntry> index;
+        std::ifstream file(index_file, std::ios::binary);
+        if (!file) return index;
+
+        size_t count;
+        file.read(reinterpret_cast<char*>(&count), sizeof(count));
+
+        for (size_t i = 0; i < count; i++) {
+            size_t key_len;
+            file.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
+
+            std::string key(key_len, '\0');
+            file.read(&key[0], key_len);
+
+            IndexEntry entry;
+            file.read(reinterpret_cast<char*>(&entry.offset), sizeof(entry.offset));
+            file.read(reinterpret_cast<char*>(&entry.size), sizeof(entry.size));
+            entry.key = key;
+
+            index[key] = entry;
+        }
+
+        file.close();
+        return index;
     }
 
-    std::vector<int> read_values(const std::string& index) {
+    std::vector<int> read_values(size_t offset, size_t size) {
         std::vector<int> values;
-        std::string filepath = get_file_path(index);
+        if (size == 0) return values;
 
-        if (!fs::exists(filepath)) {
-            return values;
-        }
+        std::ifstream file(data_file, std::ios::binary);
+        if (!file) return values;
 
-        std::ifstream file(filepath, std::ios::binary);
-        if (!file) {
-            return values;
-        }
+        file.seekg(offset);
 
-        int count;
+        size_t count;
         file.read(reinterpret_cast<char*>(&count), sizeof(count));
 
         values.resize(count);
-        for (int i = 0; i < count; i++) {
+        for (size_t i = 0; i < count; i++) {
             file.read(reinterpret_cast<char*>(&values[i]), sizeof(values[i]));
         }
 
@@ -54,15 +88,18 @@ private:
         return values;
     }
 
-    void write_values(const std::string& index, const std::vector<int>& values) {
-        std::string filepath = get_file_path(index);
-
-        std::ofstream file(filepath, std::ios::binary);
+    void write_values(size_t offset, const std::vector<int>& values) {
+        std::fstream file(data_file, std::ios::in | std::ios::out | std::ios::binary);
         if (!file) {
-            return;
+            std::ofstream create_file(data_file, std::ios::binary);
+            create_file.close();
+            file.open(data_file, std::ios::in | std::ios::out | std::ios::binary);
+            if (!file) return;
         }
 
-        int count = values.size();
+        file.seekp(offset);
+
+        size_t count = values.size();
         file.write(reinterpret_cast<const char*>(&count), sizeof(count));
 
         for (int value : values) {
@@ -73,41 +110,76 @@ private:
     }
 
 public:
-    FileStorage(const std::string& dir = "database") : base_dir(dir) {
-        if (!fs::exists(base_dir)) {
-            fs::create_directory(base_dir);
-        }
-    }
+    FileStorage(const std::string& base_name = "database")
+        : data_file(base_name + ".dat"), index_file(base_name + ".idx") {}
 
     void insert(const std::string& index, int value) {
-        std::vector<int> values = read_values(index);
+        auto idx = load_index();
+
+        std::vector<int> values;
+        size_t old_offset = 0;
+        size_t old_size = 0;
+
+        if (idx.find(index) != idx.end()) {
+            const auto& entry = idx[index];
+            old_offset = entry.offset;
+            old_size = entry.size;
+            values = read_values(old_offset, old_size);
+        }
 
         auto it = std::lower_bound(values.begin(), values.end(), value);
         if (it == values.end() || *it != value) {
             values.insert(it, value);
-            write_values(index, values);
+
+            size_t new_size = sizeof(size_t) + values.size() * sizeof(int);
+
+            if (old_size >= new_size) {
+                write_values(old_offset, values);
+            } else {
+                std::ofstream data(data_file, std::ios::app | std::ios::binary);
+                size_t new_offset = data.tellp();
+                data.close();
+
+                write_values(new_offset, values);
+                idx[index] = IndexEntry(index, new_offset, new_size);
+                save_index(idx);
+            }
         }
     }
 
     void remove(const std::string& index, int value) {
-        std::vector<int> values = read_values(index);
+        auto idx = load_index();
+
+        if (idx.find(index) == idx.end()) return;
+
+        const auto& entry = idx[index];
+        auto values = read_values(entry.offset, entry.size);
 
         auto it = std::lower_bound(values.begin(), values.end(), value);
         if (it != values.end() && *it == value) {
             values.erase(it);
+
             if (values.empty()) {
-                std::string filepath = get_file_path(index);
-                if (fs::exists(filepath)) {
-                    fs::remove(filepath);
-                }
+                idx.erase(index);
+                save_index(idx);
             } else {
-                write_values(index, values);
+                write_values(entry.offset, values);
+                size_t new_size = sizeof(size_t) + values.size() * sizeof(int);
+                idx[index] = IndexEntry(index, entry.offset, new_size);
+                save_index(idx);
             }
         }
     }
 
     std::vector<int> find(const std::string& index) {
-        return read_values(index);
+        auto idx = load_index();
+
+        if (idx.find(index) == idx.end()) {
+            return std::vector<int>();
+        }
+
+        const auto& entry = idx[index];
+        return read_values(entry.offset, entry.size);
     }
 };
 
