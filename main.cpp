@@ -12,38 +12,27 @@ class FileStorage {
 private:
     std::string data_file;
     std::string index_file;
+    std::map<std::string, size_t> index_cache;
+    std::map<std::string, std::vector<int>> value_cache;
+    bool index_loaded;
+    size_t data_file_size;
 
     struct IndexEntry {
-        std::string key;
         size_t offset;
-        size_t size;
+        size_t count;
 
-        IndexEntry() : offset(0), size(0) {}
-        IndexEntry(const std::string& k, size_t o, size_t s) : key(k), offset(o), size(s) {}
+        IndexEntry() : offset(0), count(0) {}
+        IndexEntry(size_t o, size_t c) : offset(o), count(c) {}
     };
 
-    void save_index(const std::map<std::string, IndexEntry>& index) {
-        std::ofstream file(index_file, std::ios::binary);
-        if (!file) return;
+    void load_index() {
+        if (index_loaded) return;
 
-        size_t count = index.size();
-        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-
-        for (const auto& [key, entry] : index) {
-            size_t key_len = key.length();
-            file.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
-            file.write(key.c_str(), key_len);
-            file.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
-            file.write(reinterpret_cast<const char*>(&entry.size), sizeof(entry.size));
-        }
-
-        file.close();
-    }
-
-    std::map<std::string, IndexEntry> load_index() {
-        std::map<std::string, IndexEntry> index;
         std::ifstream file(index_file, std::ios::binary);
-        if (!file) return index;
+        if (!file) {
+            index_loaded = true;
+            return;
+        }
 
         size_t count;
         file.read(reinterpret_cast<char*>(&count), sizeof(count));
@@ -57,29 +46,47 @@ private:
 
             IndexEntry entry;
             file.read(reinterpret_cast<char*>(&entry.offset), sizeof(entry.offset));
-            file.read(reinterpret_cast<char*>(&entry.size), sizeof(entry.size));
-            entry.key = key;
+            file.read(reinterpret_cast<char*>(&entry.count), sizeof(entry.count));
 
-            index[key] = entry;
+            index_cache[key] = entry.offset;
         }
 
         file.close();
-        return index;
+        index_loaded = true;
     }
 
-    std::vector<int> read_values(size_t offset, size_t size) {
-        std::vector<int> values;
-        if (size == 0) return values;
+    void save_index() {
+        std::ofstream file(index_file, std::ios::binary);
+        if (!file) return;
+
+        size_t count = index_cache.size();
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+        for (const auto& [key, offset] : index_cache) {
+            auto it = value_cache.find(key);
+            if (it == value_cache.end()) continue;
+
+            size_t key_len = key.length();
+            file.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+            file.write(key.c_str(), key_len);
+            file.write(reinterpret_cast<const char*>(&offset), sizeof(offset));
+
+            size_t value_count = it->second.size();
+            file.write(reinterpret_cast<const char*>(&value_count), sizeof(value_count));
+        }
+
+        file.close();
+    }
+
+    std::vector<int> read_values(size_t offset, size_t count) {
+        std::vector<int> values(count);
+        if (count == 0) return values;
 
         std::ifstream file(data_file, std::ios::binary);
-        if (!file) return values;
+        if (!file) return std::vector<int>();
 
         file.seekg(offset);
 
-        size_t count;
-        file.read(reinterpret_cast<char*>(&count), sizeof(count));
-
-        values.resize(count);
         for (size_t i = 0; i < count; i++) {
             file.read(reinterpret_cast<char*>(&values[i]), sizeof(values[i]));
         }
@@ -99,8 +106,19 @@ private:
 
         file.seekp(offset);
 
-        size_t count = values.size();
-        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (int value : values) {
+            file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+        }
+
+        file.close();
+    }
+
+    void append_values(const std::vector<int>& values, size_t& offset, size_t& count) {
+        std::ofstream file(data_file, std::ios::app | std::ios::binary);
+        if (!file) return;
+
+        offset = file.tellp();
+        count = values.size();
 
         for (int value : values) {
             file.write(reinterpret_cast<const char*>(&value), sizeof(value));
@@ -111,75 +129,104 @@ private:
 
 public:
     FileStorage(const std::string& base_name = "database")
-        : data_file(base_name + ".dat"), index_file(base_name + ".idx") {}
+        : data_file(base_name + ".dat"), index_file(base_name + ".idx"),
+          index_loaded(false), data_file_size(0) {}
+
+    ~FileStorage() {
+        save_index();
+    }
 
     void insert(const std::string& index, int value) {
-        auto idx = load_index();
+        load_index();
 
-        std::vector<int> values;
-        size_t old_offset = 0;
-        size_t old_size = 0;
-
-        if (idx.find(index) != idx.end()) {
-            const auto& entry = idx[index];
-            old_offset = entry.offset;
-            old_size = entry.size;
-            values = read_values(old_offset, old_size);
+        auto& values = value_cache[index];
+        if (values.empty() && index_cache.find(index) != index_cache.end()) {
+            size_t offset = index_cache[index];
+            auto it = value_cache.find(index);
+            if (it != value_cache.end()) {
+                values = it->second;
+            } else {
+                size_t count = 0;
+                std::ifstream check_file(data_file, std::ios::binary);
+                if (check_file) {
+                    check_file.seekg(offset - sizeof(size_t));
+                    check_file.read(reinterpret_cast<char*>(&count), sizeof(count));
+                    check_file.close();
+                }
+                values = read_values(offset, count);
+            }
         }
 
         auto it = std::lower_bound(values.begin(), values.end(), value);
         if (it == values.end() || *it != value) {
             values.insert(it, value);
 
-            size_t new_size = sizeof(size_t) + values.size() * sizeof(int);
-
-            if (old_size >= new_size) {
-                write_values(old_offset, values);
+            if (index_cache.find(index) == index_cache.end()) {
+                size_t offset, count;
+                append_values(values, offset, count);
+                index_cache[index] = offset;
             } else {
-                std::ofstream data(data_file, std::ios::app | std::ios::binary);
-                size_t new_offset = data.tellp();
-                data.close();
-
-                write_values(new_offset, values);
-                idx[index] = IndexEntry(index, new_offset, new_size);
-                save_index(idx);
+                size_t offset = index_cache[index];
+                write_values(offset, values);
             }
         }
     }
 
     void remove(const std::string& index, int value) {
-        auto idx = load_index();
+        load_index();
 
-        if (idx.find(index) == idx.end()) return;
+        if (index_cache.find(index) == index_cache.end()) return;
 
-        const auto& entry = idx[index];
-        auto values = read_values(entry.offset, entry.size);
+        auto& values = value_cache[index];
+        if (values.empty()) {
+            size_t offset = index_cache[index];
+            size_t count = 0;
+            std::ifstream check_file(data_file, std::ios::binary);
+            if (check_file) {
+                check_file.seekg(offset - sizeof(size_t));
+                check_file.read(reinterpret_cast<char*>(&count), sizeof(count));
+                check_file.close();
+            }
+            values = read_values(offset, count);
+        }
 
         auto it = std::lower_bound(values.begin(), values.end(), value);
         if (it != values.end() && *it == value) {
             values.erase(it);
 
             if (values.empty()) {
-                idx.erase(index);
-                save_index(idx);
+                index_cache.erase(index);
+                value_cache.erase(index);
             } else {
-                write_values(entry.offset, values);
-                size_t new_size = sizeof(size_t) + values.size() * sizeof(int);
-                idx[index] = IndexEntry(index, entry.offset, new_size);
-                save_index(idx);
+                size_t offset = index_cache[index];
+                write_values(offset, values);
             }
         }
     }
 
     std::vector<int> find(const std::string& index) {
-        auto idx = load_index();
+        load_index();
 
-        if (idx.find(index) == idx.end()) {
+        if (index_cache.find(index) == index_cache.end()) {
             return std::vector<int>();
         }
 
-        const auto& entry = idx[index];
-        return read_values(entry.offset, entry.size);
+        auto& values = value_cache[index];
+        if (!values.empty()) {
+            return values;
+        }
+
+        size_t offset = index_cache[index];
+        size_t count = 0;
+        std::ifstream check_file(data_file, std::ios::binary);
+        if (check_file) {
+            check_file.seekg(offset - sizeof(size_t));
+            check_file.read(reinterpret_cast<char*>(&count), sizeof(count));
+            check_file.close();
+        }
+
+        values = read_values(offset, count);
+        return values;
     }
 };
 
