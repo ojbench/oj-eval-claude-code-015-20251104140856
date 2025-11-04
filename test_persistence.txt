@@ -1,0 +1,6 @@
+5
+insert key1 10
+insert key1 5
+insert key1 15
+find key1
+quit

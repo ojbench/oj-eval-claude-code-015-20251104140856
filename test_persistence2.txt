@@ -1,0 +1,4 @@
+2
+find key1
+insert key2 20
+find key2
