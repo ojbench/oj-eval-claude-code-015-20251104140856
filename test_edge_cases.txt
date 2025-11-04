@@ -1,0 +1,11 @@
+10
+insert test 5
+insert test 3
+insert test 7
+find test
+delete test 5
+find test
+delete test 3
+delete test 7
+find test
+find nonexistent
